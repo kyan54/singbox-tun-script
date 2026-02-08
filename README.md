@@ -23,8 +23,8 @@ chmod +x install-singbox-tun.sh
 
 安装过程中会提示输入关键参数。
 
-## v2ray / Xray 环境搭建（可选）
-如果你需要快速搭建 v2ray / Xray 环境，可使用以下脚本：
+## 自建服务端（VLESS + reality）环境搭建（可选）
+如果你需要快速搭建 （VLESS + reality）环境，可使用以下脚本：
 
 ```bash
 wget --no-check-certificate -O ${HOME}/Xray-script.sh https://raw.githubusercontent.com/zxcvos/Xray-script/main/install.sh && bash ${HOME}/Xray-script.sh
