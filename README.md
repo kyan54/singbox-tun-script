@@ -71,6 +71,7 @@ VLESS_URL='vless://UUID@HOST:PORT?encryption=none&flow=xtls-rprx-vision&security
 sudo systemctl start sing-box-tun
 sudo systemctl stop sing-box-tun
 sudo systemctl status sing-box-tun
+sudo systemctl enable sing-box-tun
 sudo journalctl -u sing-box-tun -n 120 --no-pager
 
 # 或用 wrapper
