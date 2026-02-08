@@ -3,6 +3,12 @@
 这个仓库包含两个脚本：
 - `install-singbox-tun.sh`：安装 sing-box、生成配置、（可选）写入 systemd 单元并创建辅助命令
 - `uninstall-singbox-tun.sh`：按当前安装方式卸载
+- 本代码由AI生成
+
+## 主要意图
+在 WSL 或 Linux 中安装并启动 sing-box 的 TUN 模式，同时旁路本机与局域网 IP，方便在国内访问大模型 API。  
+这样可以把网络接管限制在 WSL 内部，避免 Windows 端开启 TUN 后影响其他应用或日常娱乐。  
+日常开发建议在 VS Code 连接 WSL 进行工作流，Windows 保持正常网络环境，做到“开发顺滑，AI Coding 时 Windows 还能随手娱乐”，让幸福感稳稳在线。
 
 ## 适用环境
 - Linux / WSL（支持 `ip`、`tar`、`curl`）
@@ -16,6 +22,13 @@ chmod +x install-singbox-tun.sh
 ```
 
 安装过程中会提示输入关键参数。
+
+## v2ray / Xray 环境搭建（可选）
+如果你需要快速搭建 v2ray / Xray 环境，可使用以下脚本：
+
+```bash
+wget --no-check-certificate -O ${HOME}/Xray-script.sh https://raw.githubusercontent.com/zxcvos/Xray-script/main/install.sh && bash ${HOME}/Xray-script.sh
+```
 
 ### 使用本地 tar.gz
 如果当前目录已有 `sing-box.tar.gz`，脚本会自动使用它并跳过下载；只有在本地不存在时才会从 GitHub 下载。
