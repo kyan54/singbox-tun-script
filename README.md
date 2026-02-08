@@ -31,7 +31,16 @@ wget --no-check-certificate -O ${HOME}/Xray-script.sh https://raw.githubusercont
 ```
 
 ### 使用本地 tar.gz
-如果当前目录已有 `sing-box.tar.gz`，脚本会自动使用它并跳过下载；只有在本地不存在时才会从 GitHub 下载。
+如果脚本下载较慢或无法直连 GitHub，可先手动下载 release 包，再交给脚本复用：
+
+1) 从发布页下载对应版本  
+```
+https://github.com/SagerNet/sing-box/releases
+```
+2) 将文件放到脚本目录并重命名为 `sing-box.tar.gz`
+
+脚本会优先使用该文件并跳过下载；只有在本地不存在时才会从 GitHub 下载。
+
 
 ### 只输入一个 VLESS 链接
 你可以直接粘贴完整的 VLESS URL，脚本会自动解析：
