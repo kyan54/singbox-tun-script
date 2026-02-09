@@ -21,7 +21,7 @@ chmod +x install-singbox-tun.sh
 ./install-singbox-tun.sh
 ```
 
-安装过程中会提示输入关键参数。
+脚本会读取当前目录的 `singbox-tun.conf`，请先按模板填写 `VLESS_URL` 等参数。
 
 ## 自建服务端（VLESS + reality）环境搭建（可选）
 如果你需要快速搭建 （VLESS + reality）环境，可使用以下脚本：
@@ -42,17 +42,14 @@ https://github.com/SagerNet/sing-box/releases
 脚本会优先使用该文件并跳过下载；只有在本地不存在时才会从 GitHub 下载。
 
 
-### 只输入一个 VLESS 链接
-你可以直接粘贴完整的 VLESS URL，脚本会自动解析：
+### 只填写一个 VLESS 链接
+你可以在 `singbox-tun.conf` 中直接填写完整的 VLESS URL，脚本会自动解析：
 
 ```bash
-# 交互输入
-./install-singbox-tun.sh
-# 在提示 “VLESS URL (optional)” 处粘贴：
-# vless://UUID@HOST:PORT?encryption=none&flow=xtls-rprx-vision&security=reality&sni=...&fp=chrome&pbk=...&sid=...&spx=%2F&type=tcp&headerType=none
+VLESS_URL="vless://UUID@HOST:PORT?encryption=none&flow=xtls-rprx-vision&security=reality&sni=...&fp=chrome&pbk=...&sid=...&spx=%2F&type=tcp&headerType=none"
 ```
 
-或非交互：
+也可以临时在命令行中覆盖：
 
 ```bash
 VLESS_URL='vless://UUID@HOST:PORT?encryption=none&flow=xtls-rprx-vision&security=reality&sni=...&fp=chrome&pbk=...&sid=...&spx=%2F&type=tcp&headerType=none' \
@@ -94,11 +91,12 @@ USE_SYSTEMD=0 ./install-singbox-tun.sh
 - `100.64.0.0/10`
 - `169.254.0.0/16`
 
-如需自定义：
+如需自定义，编辑 `singbox-tun.conf`：
 
 ```bash
-BYPASS_CIDRS="10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,你的网段/掩码" \
-  ./install-singbox-tun.sh
+DIRECT_CIDRS=("10.0.0.0/8" "172.16.0.0/12" "192.168.0.0/16" "你的网段/掩码")
+DIRECT_IPS=("1.2.3.4" "5.6.7.8") # 会自动补 /32
+DIRECT_DOMAINS=("example.com" "example.net")
 ```
 
 ## 配置文件
@@ -137,6 +135,15 @@ chmod +x uninstall-singbox-tun.sh
 ```bash
 sudo journalctl -u sing-box-tun -n 120 --no-pager
 ```
+
+若在 WSL 中频繁遇到 `restart` 失败，请在 `singbox-tun.conf` 固定网关与网卡：
+
+```bash
+GW="172.19.32.1"
+DEV="eth0"
+```
+
+这样可以避免默认路由已经是 `tun` 时的误检测。
 
 ## 安全说明
 脚本内的默认敏感参数已替换为占位符（`YOUR_*`）。

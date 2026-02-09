@@ -8,25 +8,59 @@ require_cmd() {
   }
 }
 
-prompt() {
-  local label="$1"
-  local default="$2"
-  local input
-  if [[ -n "$default" ]]; then
-    read -r -p "$label [$default]: " input
-    echo "${input:-$default}"
-  else
-    read -r -p "$label: " input
-    echo "$input"
-  fi
-}
-
 detect_default_gw() {
-  ip route 2>/dev/null | awk '/^default / {for (i=1; i<=NF; i++) if ($i=="via") {print $(i+1); exit}}'
+  ip route 2>/dev/null | awk '
+    $1=="default" {
+      dev="";
+      for (i=1; i<=NF; i++) if ($i=="dev") dev=$(i+1)
+      if (dev ~ /^tun[0-9]+$/) next
+      for (i=1; i<=NF; i++) if ($i=="via") {print $(i+1); exit}
+    }'
 }
 
 detect_default_dev() {
-  ip route 2>/dev/null | awk '/^default / {for (i=1; i<=NF; i++) if ($i=="dev") {print $(i+1); exit}}'
+  local dev
+  dev="$(ip route 2>/dev/null | awk '
+    $1=="default" {
+      d="";
+      for (i=1; i<=NF; i++) if ($i=="dev") d=$(i+1)
+      if (d ~ /^tun[0-9]+$/) next
+      if (d != "") {print d; exit}
+    }')"
+  if [[ -n "$dev" ]]; then
+    echo "$dev"
+    return
+  fi
+  ip -o -4 addr show up 2>/dev/null | awk '{print $2}' | grep -v '^tun' | head -n 1
+}
+
+is_wsl() {
+  grep -qi microsoft /proc/version 2>/dev/null
+}
+
+guess_wsl_gw() {
+  local dev="$1"
+  local cidr
+  cidr="$(ip -o -4 route show dev "$dev" 2>/dev/null | awk '/proto kernel/ {print $1; exit}')"
+  if [[ -z "$cidr" ]]; then
+    return 1
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$cidr" <<'PY'
+import ipaddress
+import sys
+
+cidr = sys.argv[1]
+try:
+    net = ipaddress.ip_network(cidr, strict=False)
+    gw = net.network_address + 1
+    print(gw)
+except Exception:
+    pass
+PY
+  else
+    return 1
+  fi
 }
 
 has_systemd() {
@@ -72,24 +106,12 @@ for k, v in fields.items():
 PY
 }
 
-default_bypass_cidrs() {
-  echo "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,100.64.0.0/10,169.254.0.0/16"
-}
 
-trim() {
-  local s="$1"
-  s="${s#"${s%%[![:space:]]*}"}"
-  s="${s%"${s##*[![:space:]]}"}"
-  printf '%s' "$s"
-}
-
-csv_to_json_array() {
-  local csv="$1"
+array_to_json() {
+  local -n arr="$1"
   local out=""
   local item
-  IFS=',' read -r -a items <<<"$csv"
-  for item in "${items[@]}"; do
-    item="$(trim "$item")"
+  for item in "${arr[@]}"; do
     [[ -z "$item" ]] && continue
     if [[ -n "$out" ]]; then
       out+=", "
@@ -102,6 +124,21 @@ csv_to_json_array() {
     echo "[$out]"
   fi
 }
+
+array_to_csv() {
+  local -n arr="$1"
+  local out=""
+  local item
+  for item in "${arr[@]}"; do
+    [[ -z "$item" ]] && continue
+    if [[ -n "$out" ]]; then
+      out+=","
+    fi
+    out+="$item"
+  done
+  echo "$out"
+}
+
 
 detect_tun_if() {
   local i
@@ -165,60 +202,90 @@ PY
   fi
 }
 
+detect_arch() {
+  local m
+  m="$(uname -m)"
+  case "$m" in
+    x86_64|amd64) echo "linux-amd64" ;;
+    aarch64|arm64) echo "linux-arm64" ;;
+    armv7l) echo "linux-armv7" ;;
+    armv6l) echo "linux-armv6" ;;
+    *)
+      echo "[!] Unsupported arch: $m" >&2
+      exit 1
+      ;;
+  esac
+}
+
+detect_latest_version() {
+  python3 - <<'PY'
+import json
+import sys
+import urllib.request
+
+url = "https://api.github.com/repos/SagerNet/sing-box/releases/latest"
+try:
+    with urllib.request.urlopen(url, timeout=10) as f:
+        data = json.load(f)
+except Exception as e:
+    print("[!] Failed to fetch latest sing-box version:", e, file=sys.stderr)
+    sys.exit(1)
+
+tag = data.get("tag_name", "")
+if not tag:
+    print("[!] Could not determine latest version", file=sys.stderr)
+    sys.exit(1)
+if tag.startswith("v"):
+    tag = tag[1:]
+print(tag)
+PY
+}
+
 require_cmd curl
 require_cmd tar
 require_cmd ip
 require_cmd awk
+require_cmd python3
 
-echo "[*] sing-box TUN one-click installer"
+echo "[*] sing-box TUN installer"
 echo ""
 
-VERSION="$(prompt "Sing-box version" "1.13.0-beta.7")"
-ARCH="$(prompt "Release arch (e.g., linux-amd64)" "linux-amd64")"
-BIN_PATH="$(prompt "Install path for sing-box binary" "/usr/local/bin/sing-box")"
-CONF_PATH="$(prompt "Config path" "/etc/sing-box-tun.json")"
-
-VLESS_URL_INPUT="$(prompt "VLESS URL (optional)" "${VLESS_URL:-}")"
-if [[ -n "$VLESS_URL_INPUT" ]]; then
-  if ! command -v python3 >/dev/null 2>&1; then
-    echo "[!] python3 is required to parse VLESS URL." >&2
-    exit 1
-  fi
-  eval "$(parse_vless_url "$VLESS_URL_INPUT")"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONF_FILE="${CONF_FILE:-$SCRIPT_DIR/singbox-tun.conf}"
+if [[ ! -f "$CONF_FILE" ]]; then
+  echo "[!] Config file not found: $CONF_FILE" >&2
+  echo "    Create it based on: $SCRIPT_DIR/singbox-tun.conf" >&2
+  exit 1
 fi
 
-SERVER_IP="${SERVER_IP:-${VLESS_HOST:-}}"
-if [[ -z "$SERVER_IP" ]]; then
-  SERVER_IP="$(prompt "VLESS server IP" "YOUR_SERVER_IP")"
+# shellcheck disable=SC1090
+source "$CONF_FILE"
+
+if [[ -z "${VLESS_URL:-}" ]]; then
+  echo "[!] VLESS_URL is required in $CONF_FILE" >&2
+  exit 1
 fi
-SERVER_PORT="${SERVER_PORT:-${VLESS_PORT:-}}"
-if [[ -z "$SERVER_PORT" ]]; then
-  SERVER_PORT="$(prompt "VLESS server port" "443")"
+
+eval "$(parse_vless_url "$VLESS_URL")"
+
+SERVER_IP="${VLESS_HOST:-}"
+SERVER_PORT="${VLESS_PORT:-}"
+UUID="${VLESS_UUID:-}"
+FLOW="${VLESS_FLOW:-}"
+SERVER_NAME="${VLESS_SNI:-}"
+FINGERPRINT="${VLESS_FP:-}"
+PUBLIC_KEY="${VLESS_PBK:-}"
+SHORT_ID="${VLESS_SID:-}"
+
+if [[ -z "$SERVER_IP" || -z "$SERVER_PORT" || -z "$UUID" || -z "$FLOW" || -z "$SERVER_NAME" || -z "$FINGERPRINT" || -z "$PUBLIC_KEY" || -z "$SHORT_ID" ]]; then
+  echo "[!] VLESS_URL is missing required fields (host/port/uuid/flow/sni/fp/pbk/sid)." >&2
+  exit 1
 fi
-UUID="${UUID:-${VLESS_UUID:-}}"
-if [[ -z "$UUID" ]]; then
-  UUID="$(prompt "VLESS UUID" "YOUR_UUID")"
-fi
-FLOW="${FLOW:-${VLESS_FLOW:-}}"
-if [[ -z "$FLOW" ]]; then
-  FLOW="$(prompt "Flow" "xtls-rprx-vision")"
-fi
-SERVER_NAME="${SERVER_NAME:-${VLESS_SNI:-}}"
-if [[ -z "$SERVER_NAME" ]]; then
-  SERVER_NAME="$(prompt "TLS server_name (SNI)" "${SERVER_NAME:-your.sni.host}")"
-fi
-FINGERPRINT="${FINGERPRINT:-${VLESS_FP:-}}"
-if [[ -z "$FINGERPRINT" ]]; then
-  FINGERPRINT="$(prompt "uTLS fingerprint" "chrome")"
-fi
-PUBLIC_KEY="${PUBLIC_KEY:-${VLESS_PBK:-}}"
-if [[ -z "$PUBLIC_KEY" ]]; then
-  PUBLIC_KEY="$(prompt "Reality public_key" "YOUR_PUBLIC_KEY")"
-fi
-SHORT_ID="${SHORT_ID:-${VLESS_SID:-}}"
-if [[ -z "$SHORT_ID" ]]; then
-  SHORT_ID="$(prompt "Reality short_id" "YOUR_SHORT_ID")"
-fi
+
+VERSION="${VERSION:-}"
+ARCH="${ARCH:-}"
+BIN_PATH="${BIN_PATH:-/usr/local/bin/sing-box}"
+CONF_PATH="${CONF_PATH:-/etc/sing-box-tun.json}"
 
 TUN_IF="${TUN_IF:-$(detect_tun_if)}"
 TUN_ADDR="${TUN_ADDR:-$(detect_tun_addr)}"
@@ -227,11 +294,48 @@ GW_DETECTED="$(detect_default_gw || true)"
 DEV_DETECTED="$(detect_default_dev || true)"
 GW="${GW:-${GW_DETECTED:-}}"
 DEV="${DEV:-${DEV_DETECTED:-eth0}}"
-BYPASS_CIDRS="${BYPASS_CIDRS:-$(default_bypass_cidrs)}"
-BYPASS_JSON="$(csv_to_json_array "$BYPASS_CIDRS")"
+if [[ -z "$GW" && -n "$DEV" ]] && is_wsl; then
+  GW_GUESS="$(guess_wsl_gw "$DEV" || true)"
+  if [[ -n "${GW_GUESS:-}" ]]; then
+    GW="$GW_GUESS"
+  fi
+fi
+
+DIRECT_DOMAINS=(${DIRECT_DOMAINS[@]:-})
+DIRECT_IPS=(${DIRECT_IPS[@]:-})
+DIRECT_CIDRS=(${DIRECT_CIDRS[@]:-})
+
+DIRECT_DOMAINS_JSON="$(array_to_json DIRECT_DOMAINS)"
+
+DIRECT_IP_CIDRS=()
+for ip in "${DIRECT_IPS[@]}"; do
+  [[ -z "$ip" ]] && continue
+  if [[ "$ip" == */* ]]; then
+    DIRECT_IP_CIDRS+=("$ip")
+  else
+    DIRECT_IP_CIDRS+=("${ip}/32")
+  fi
+done
+for cidr in "${DIRECT_CIDRS[@]}"; do
+  [[ -z "$cidr" ]] && continue
+  DIRECT_IP_CIDRS+=("$cidr")
+done
+DIRECT_IP_CIDRS_JSON="$(array_to_json DIRECT_IP_CIDRS)"
+DIRECT_IP_CIDRS_CSV="$(array_to_csv DIRECT_IP_CIDRS)"
+
 ROUTE_RULES=""
-if [[ "$BYPASS_JSON" != "[]" ]]; then
-  ROUTE_RULES="  \"rules\": [ { \"ip_cidr\": $BYPASS_JSON, \"outbound\": \"direct\" } ],"
+if [[ "$DIRECT_DOMAINS_JSON" != "[]" || "$DIRECT_IP_CIDRS_JSON" != "[]" ]]; then
+  ROUTE_RULES="    \"rules\": ["
+  if [[ "$DIRECT_DOMAINS_JSON" != "[]" ]]; then
+    ROUTE_RULES+=" { \"domain\": $DIRECT_DOMAINS_JSON, \"outbound\": \"direct\" }"
+    if [[ "$DIRECT_IP_CIDRS_JSON" != "[]" ]]; then
+      ROUTE_RULES+=","
+    fi
+  fi
+  if [[ "$DIRECT_IP_CIDRS_JSON" != "[]" ]]; then
+    ROUTE_RULES+=" { \"ip_cidr\": $DIRECT_IP_CIDRS_JSON, \"outbound\": \"direct\" }"
+  fi
+  ROUTE_RULES+=" ],"
 fi
 
 USE_SYSTEMD="${USE_SYSTEMD:-auto}"
@@ -247,11 +351,32 @@ if [[ "$USE_SYSTEMD" == "1" ]] && ! has_systemd; then
   exit 1
 fi
 
-HELPER_PATH="$(prompt "Helper script path" "$HOME/.local/bin/sb-tun")"
-LOG_PATH="$(prompt "Helper log path" "$HOME/.local/state/sing-box/sing-box-tun.log")"
-PID_PATH="$(prompt "Helper pid path" "$HOME/.local/state/sing-box/sing-box-tun.pid")"
+HELPER_PATH="${HELPER_PATH:-$HOME/.local/bin/sb-tun}"
+LOG_PATH="${LOG_PATH:-$HOME/.local/state/sing-box/sing-box-tun.log}"
+PID_PATH="${PID_PATH:-$HOME/.local/state/sing-box/sing-box-tun.pid}"
 
-URL="https://github.com/SagerNet/sing-box/releases/download/v${VERSION}/sing-box-${VERSION}-${ARCH}.tar.gz"
+OVERWRITE_CONF="${OVERWRITE_CONF:-0}"
+OVERWRITE_HELPER="${OVERWRITE_HELPER:-0}"
+
+if [[ -z "$ARCH" ]]; then
+  ARCH="$(detect_arch)"
+fi
+
+LOCAL_TAR="$PWD/sing-box.tar.gz"
+USE_LOCAL_TAR="0"
+if [[ -f "$LOCAL_TAR" ]]; then
+  USE_LOCAL_TAR="1"
+fi
+
+if [[ -z "$VERSION" && "$USE_LOCAL_TAR" != "1" ]]; then
+  VERSION="$(detect_latest_version)"
+fi
+
+if [[ "$USE_LOCAL_TAR" == "1" ]]; then
+  URL="local: $LOCAL_TAR"
+else
+  URL="https://github.com/SagerNet/sing-box/releases/download/v${VERSION}/sing-box-${VERSION}-${ARCH}.tar.gz"
+fi
 
 echo ""
 echo "[*] Preparing to install:"
@@ -262,7 +387,6 @@ echo "    Helper: $HELPER_PATH"
 echo "    SNI: $SERVER_NAME"
 echo "    TUN: $TUN_IF ($TUN_ADDR)"
 echo "    Route: gw=${GW:-<none>} dev=$DEV"
-echo "    Bypass: ${BYPASS_CIDRS}"
 if [[ "$USE_SYSTEMD" == "1" ]]; then
   echo "    systemd: enabled"
 else
@@ -270,11 +394,19 @@ else
 fi
 echo ""
 
-read -r -p "Continue? [y/N]: " confirm
-case "${confirm,,}" in
-  y|yes) ;;
-  *) echo "Aborted."; exit 1 ;;
-esac
+if [[ "$OVERWRITE_CONF" != "1" && -f "$CONF_PATH" ]]; then
+  read -r -p "[?] 检测到已有配置文件，是否覆盖？[y/N]: " ow_conf
+  case "${ow_conf,,}" in
+    y|yes) OVERWRITE_CONF="1" ;;
+  esac
+fi
+
+if [[ "$OVERWRITE_HELPER" != "1" && -f "$HELPER_PATH" ]]; then
+  read -r -p "[?] 检测到已有 helper 脚本，是否覆盖？[y/N]: " ow_helper
+  case "${ow_helper,,}" in
+    y|yes) OVERWRITE_HELPER="1" ;;
+  esac
+fi
 
 sudo -v
 
@@ -284,8 +416,7 @@ trap cleanup EXIT
 
 mkdir -p "$(dirname "$HELPER_PATH")" "$(dirname "$LOG_PATH")" "$(dirname "$PID_PATH")"
 
-LOCAL_TAR="$PWD/sing-box.tar.gz"
-if [[ -f "$LOCAL_TAR" ]]; then
+if [[ "$USE_LOCAL_TAR" == "1" ]]; then
   echo "[*] Using existing tarball: $LOCAL_TAR"
   TAR_SRC="$LOCAL_TAR"
 else
@@ -307,8 +438,7 @@ echo "[*] Installing binary..."
 sudo install -m 755 "$bin_src" "$BIN_PATH"
 
 if [[ -f "$CONF_PATH" ]]; then
-  read -r -p "[?] Config exists at $CONF_PATH, overwrite? [y/N]: " ow_conf
-  if [[ "${ow_conf,,}" != "y" && "${ow_conf,,}" != "yes" ]]; then
+  if [[ "$OVERWRITE_CONF" != "1" ]]; then
     echo "[*] Keeping existing config."
   else
     sudo cp -f "$CONF_PATH" "${CONF_PATH}.bak.$(date +%Y%m%d%H%M%S)"
@@ -420,47 +550,134 @@ GW="${GW}"
 DEV="${DEV}"
 SERVER_IP="$SERVER_IP"
 TUN_IF="$TUN_IF"
-BYPASS_CIDRS="$BYPASS_CIDRS"
+DIRECT_IP_CIDRS="$DIRECT_IP_CIDRS_CSV"
+
+is_wsl() {
+  grep -qi microsoft /proc/version 2>/dev/null
+}
+
+guess_wsl_gw() {
+  local dev="\$1"
+  local cidr
+  cidr="\$(ip -o -4 route show dev "\$dev" 2>/dev/null | awk '/proto kernel/ {print \$1; exit}')"
+  if [[ -z "\$cidr" ]]; then
+    return 1
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "\$cidr" <<'PY'
+import ipaddress
+import sys
+
+cidr = sys.argv[1]
+try:
+    net = ipaddress.ip_network(cidr, strict=False)
+    gw = net.network_address + 1
+    print(gw)
+except Exception:
+    pass
+PY
+  else
+    return 1
+  fi
+}
+
+resolve_base_route() {
+  local dev gw
+  dev="$DEV"
+  gw="$GW"
+  if [[ -z "$dev" || "$dev" =~ ^tun[0-9]+$ || ! -e "/sys/class/net/$dev" ]]; then
+    dev="$(ip -o -4 route show default 2>/dev/null | awk '$0 !~ / dev tun[0-9]+/ {for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')"
+    if [[ -z "$dev" ]]; then
+      dev="$(ip -o -4 addr show up 2>/dev/null | awk '{print $2}' | grep -v '^tun' | head -n1)"
+    fi
+  fi
+  if [[ -z "$gw" ]]; then
+    gw="$(ip -o -4 route show default 2>/dev/null | awk '$0 !~ / dev tun[0-9]+/ {for (i=1;i<=NF;i++) if ($i=="via") {print $(i+1); exit}}')"
+  fi
+  if [[ -z "$gw" && -n "$dev" ]] && is_wsl; then
+    gw="$(guess_wsl_gw "$dev" || true)"
+  fi
+  DEV="$dev"
+  GW="$gw"
+}
 
 set_default_route() {
+  resolve_base_route
+  if [[ -z "$DEV" ]]; then
+    echo "[!] No base DEV found; skip default route restore" >&2
+    return 0
+  fi
   if [[ -n "\$GW" ]]; then
-    ip route replace default via "\$GW" dev "\$DEV"
+    ip route replace default via "\$GW" dev "\$DEV" || {
+      echo "[!] Failed to set default route via \$GW dev \$DEV" >&2
+      return 0
+    }
   else
-    ip route replace default dev "\$DEV"
+    ip route replace default dev "\$DEV" || {
+      echo "[!] Failed to set default route dev \$DEV" >&2
+      return 0
+    }
   fi
 }
 
 set_bypass_route() {
+  resolve_base_route
+  if [[ -z "$DEV" ]]; then
+    echo "[!] No base DEV found; skip bypass route" >&2
+    return 0
+  fi
   if [[ -n "\$GW" ]]; then
-    ip route replace "\$SERVER_IP/32" via "\$GW" dev "\$DEV"
+    ip route replace "\$SERVER_IP/32" via "\$GW" dev "\$DEV" || {
+      echo "[!] Failed to add bypass route for \$SERVER_IP" >&2
+      return 0
+    }
   else
-    ip route replace "\$SERVER_IP/32" dev "\$DEV"
+    ip route replace "\$SERVER_IP/32" dev "\$DEV" || {
+      echo "[!] Failed to add bypass route for \$SERVER_IP" >&2
+      return 0
+    }
   fi
 }
 
-set_bypass_cidrs() {
+set_direct_routes() {
   local cidr
-  IFS=',' read -r -a items <<<"\$BYPASS_CIDRS"
+  IFS=',' read -r -a items <<<"\$DIRECT_IP_CIDRS"
   for cidr in "\${items[@]}"; do
     cidr="\${cidr#"\${cidr%%[![:space:]]*}"}"
     cidr="\${cidr%"\${cidr##*[![:space:]]}"}"
     [[ -z "\$cidr" ]] && continue
     if [[ -n "\$GW" ]]; then
-      ip route replace "\$cidr" via "\$GW" dev "\$DEV"
+      if ! ip route replace "\$cidr" via "\$GW" dev "\$DEV"; then
+        echo "[!] Failed to add direct route: \$cidr" >&2
+      fi
     else
-      ip route replace "\$cidr" dev "\$DEV"
+      if ! ip route replace "\$cidr" dev "\$DEV"; then
+        echo "[!] Failed to add direct route: \$cidr" >&2
+      fi
     fi
   done
 }
 
+del_direct_routes() {
+  local cidr
+  IFS=',' read -r -a items <<<"\$DIRECT_IP_CIDRS"
+  for cidr in "\${items[@]}"; do
+    cidr="\${cidr#"\${cidr%%[![:space:]]*}"}"
+    cidr="\${cidr%"\${cidr##*[![:space:]]}"}"
+    [[ -z "\$cidr" ]] && continue
+    ip route del "\$cidr" 2>/dev/null || true
+  done
+}
+
+
 wait_for_tun() {
-  for i in {1..30}; do
+  for i in {1..100}; do
     if ip link show "\$TUN_IF" >/dev/null 2>&1; then
       return 0
     fi
-    sleep 0.1
+    sleep 0.2
   done
-  echo "[!] \$TUN_IF not found"
+  echo "[!] \$TUN_IF not found after waiting; skip default route switch" >&2
   return 1
 }
 
@@ -468,15 +685,19 @@ case "\${1:-}" in
   pre)
     set_default_route
     set_bypass_route
-    set_bypass_cidrs
+    set_direct_routes
     ;;
   post)
-    wait_for_tun
-    ip route replace default dev "\$TUN_IF"
+    if wait_for_tun; then
+      if ! ip route replace default dev "\$TUN_IF"; then
+        echo "[!] Failed to set default route to \$TUN_IF" >&2
+      fi
+    fi
     ;;
   stop)
     set_default_route
     ip route del "\$SERVER_IP/32" 2>/dev/null || true
+    del_direct_routes
     ;;
   *)
     echo "Usage: \$0 {pre|post|stop}"
@@ -512,8 +733,7 @@ EOF
   fi
 
   if [[ -f "$HELPER_PATH" ]]; then
-    read -r -p "[?] Helper exists at $HELPER_PATH, overwrite? [y/N]: " ow_helper
-    if [[ "${ow_helper,,}" != "y" && "${ow_helper,,}" != "yes" ]]; then
+    if [[ "$OVERWRITE_HELPER" != "1" ]]; then
       echo "[*] Keeping existing helper."
     else
       cp -f "$HELPER_PATH" "${HELPER_PATH}.bak.$(date +%Y%m%d%H%M%S)"
@@ -560,8 +780,7 @@ EOF
   fi
 else
 if [[ -f "$HELPER_PATH" ]]; then
-  read -r -p "[?] Helper exists at $HELPER_PATH, overwrite? [y/N]: " ow_helper
-  if [[ "${ow_helper,,}" != "y" && "${ow_helper,,}" != "yes" ]]; then
+  if [[ "$OVERWRITE_HELPER" != "1" ]]; then
     echo "[*] Keeping existing helper."
   else
     cp -f "$HELPER_PATH" "${HELPER_PATH}.bak.$(date +%Y%m%d%H%M%S)"
@@ -578,40 +797,126 @@ GW="${GW}"
 DEV="${DEV}"
 SERVER_IP="$SERVER_IP"
 TUN_IF="$TUN_IF"
-BYPASS_CIDRS="$BYPASS_CIDRS"
+DIRECT_IP_CIDRS="$DIRECT_IP_CIDRS_CSV"
+
+is_wsl() {
+  grep -qi microsoft /proc/version 2>/dev/null
+}
+
+guess_wsl_gw() {
+  local dev="\$1"
+  local cidr
+  cidr="\$(ip -o -4 route show dev "\$dev" 2>/dev/null | awk '/proto kernel/ {print \$1; exit}')"
+  if [[ -z "\$cidr" ]]; then
+    return 1
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "\$cidr" <<'PY'
+import ipaddress
+import sys
+
+cidr = sys.argv[1]
+try:
+    net = ipaddress.ip_network(cidr, strict=False)
+    gw = net.network_address + 1
+    print(gw)
+except Exception:
+    pass
+PY
+  else
+    return 1
+  fi
+}
+
+resolve_base_route() {
+  local dev gw
+  dev="$DEV"
+  gw="$GW"
+  if [[ -z "$dev" || "$dev" =~ ^tun[0-9]+$ || ! -e "/sys/class/net/$dev" ]]; then
+    dev="$(ip -o -4 route show default 2>/dev/null | awk '$0 !~ / dev tun[0-9]+/ {for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')"
+    if [[ -z "$dev" ]]; then
+      dev="$(ip -o -4 addr show up 2>/dev/null | awk '{print $2}' | grep -v '^tun' | head -n1)"
+    fi
+  fi
+  if [[ -z "$gw" ]]; then
+    gw="$(ip -o -4 route show default 2>/dev/null | awk '$0 !~ / dev tun[0-9]+/ {for (i=1;i<=NF;i++) if ($i=="via") {print $(i+1); exit}}')"
+  fi
+  if [[ -z "$gw" && -n "$dev" ]] && is_wsl; then
+    gw="$(guess_wsl_gw "$dev" || true)"
+  fi
+  DEV="$dev"
+  GW="$gw"
+}
 
 is_running() {
   [[ -f "\$PID_FILE" ]] && kill -0 "\$(cat "\$PID_FILE")" 2>/dev/null
 }
 
 set_default_route() {
+  resolve_base_route
+  if [[ -z "\$DEV" ]]; then
+    echo "[!] No base DEV found; skip default route restore" >&2
+    return 0
+  fi
   if [[ -n "\$GW" ]]; then
-    sudo ip route replace default via "\$GW" dev "\$DEV"
+    sudo ip route replace default via "\$GW" dev "\$DEV" || {
+      echo "[!] Failed to set default route via \$GW dev \$DEV" >&2
+      return 0
+    }
   else
-    sudo ip route replace default dev "\$DEV"
+    sudo ip route replace default dev "\$DEV" || {
+      echo "[!] Failed to set default route dev \$DEV" >&2
+      return 0
+    }
   fi
 }
 
 set_bypass_route() {
+  resolve_base_route
+  if [[ -z "\$DEV" ]]; then
+    echo "[!] No base DEV found; skip bypass route" >&2
+    return 0
+  fi
   if [[ -n "\$GW" ]]; then
-    sudo ip route replace "\$SERVER_IP/32" via "\$GW" dev "\$DEV"
+    sudo ip route replace "\$SERVER_IP/32" via "\$GW" dev "\$DEV" || {
+      echo "[!] Failed to add bypass route for \$SERVER_IP" >&2
+      return 0
+    }
   else
-    sudo ip route replace "\$SERVER_IP/32" dev "\$DEV"
+    sudo ip route replace "\$SERVER_IP/32" dev "\$DEV" || {
+      echo "[!] Failed to add bypass route for \$SERVER_IP" >&2
+      return 0
+    }
   fi
 }
 
-set_bypass_cidrs() {
+set_direct_routes() {
   local cidr
-  IFS=',' read -r -a items <<<"\$BYPASS_CIDRS"
+  IFS=',' read -r -a items <<<"\$DIRECT_IP_CIDRS"
   for cidr in "\${items[@]}"; do
     cidr="\${cidr#"\${cidr%%[![:space:]]*}"}"
     cidr="\${cidr%"\${cidr##*[![:space:]]}"}"
     [[ -z "\$cidr" ]] && continue
     if [[ -n "\$GW" ]]; then
-      sudo ip route replace "\$cidr" via "\$GW" dev "\$DEV"
+      if ! sudo ip route replace "\$cidr" via "\$GW" dev "\$DEV"; then
+        echo "[!] Failed to add direct route: \$cidr" >&2
+      fi
     else
-      sudo ip route replace "\$cidr" dev "\$DEV"
+      if ! sudo ip route replace "\$cidr" dev "\$DEV"; then
+        echo "[!] Failed to add direct route: \$cidr" >&2
+      fi
     fi
+  done
+}
+
+del_direct_routes() {
+  local cidr
+  IFS=',' read -r -a items <<<"\$DIRECT_IP_CIDRS"
+  for cidr in "\${items[@]}"; do
+    cidr="\${cidr#"\${cidr%%[![:space:]]*}"}"
+    cidr="\${cidr%"\${cidr##*[![:space:]]}"}"
+    [[ -z "\$cidr" ]] && continue
+    sudo ip route del "\$cidr" 2>/dev/null || true
   done
 }
 
@@ -634,7 +939,7 @@ start() {
 
   set_default_route
   set_bypass_route
-  set_bypass_cidrs
+  set_direct_routes
 
   : > "\$LOG_FILE"
   setsid sudo "\$SB_BIN" run -c "\$SB_CONF" >>"\$LOG_FILE" 2>&1 < /dev/null &
@@ -666,6 +971,7 @@ stop() {
 
   set_default_route
   sudo ip route del "\$SERVER_IP/32" 2>/dev/null || true
+  del_direct_routes
 
   if [[ -f "\$PID_FILE" ]]; then
     PID="\$(cat "\$PID_FILE" || true)"
@@ -731,41 +1037,129 @@ GW="${GW}"
 DEV="${DEV}"
 SERVER_IP="$SERVER_IP"
 TUN_IF="$TUN_IF"
+DIRECT_IP_CIDRS="$DIRECT_IP_CIDRS_CSV"
+
+is_wsl() {
+  grep -qi microsoft /proc/version 2>/dev/null
+}
+
+guess_wsl_gw() {
+  local dev="\$1"
+  local cidr
+  cidr="\$(ip -o -4 route show dev "\$dev" 2>/dev/null | awk '/proto kernel/ {print \$1; exit}')"
+  if [[ -z "\$cidr" ]]; then
+    return 1
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "\$cidr" <<'PY'
+import ipaddress
+import sys
+
+cidr = sys.argv[1]
+try:
+    net = ipaddress.ip_network(cidr, strict=False)
+    gw = net.network_address + 1
+    print(gw)
+except Exception:
+    pass
+PY
+  else
+    return 1
+  fi
+}
+
+resolve_base_route() {
+  local dev gw
+  dev="$DEV"
+  gw="$GW"
+  if [[ -z "$dev" || "$dev" =~ ^tun[0-9]+$ || ! -e "/sys/class/net/$dev" ]]; then
+    dev="$(ip -o -4 route show default 2>/dev/null | awk '$0 !~ / dev tun[0-9]+/ {for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')"
+    if [[ -z "$dev" ]]; then
+      dev="$(ip -o -4 addr show up 2>/dev/null | awk '{print $2}' | grep -v '^tun' | head -n1)"
+    fi
+  fi
+  if [[ -z "$gw" ]]; then
+    gw="$(ip -o -4 route show default 2>/dev/null | awk '$0 !~ / dev tun[0-9]+/ {for (i=1;i<=NF;i++) if ($i=="via") {print $(i+1); exit}}')"
+  fi
+  if [[ -z "$gw" && -n "$dev" ]] && is_wsl; then
+    gw="$(guess_wsl_gw "$dev" || true)"
+  fi
+  DEV="$dev"
+  GW="$gw"
+}
 
 is_running() {
   [[ -f "\$PID_FILE" ]] && kill -0 "\$(cat "\$PID_FILE")" 2>/dev/null
 }
 
 set_default_route() {
+  resolve_base_route
+  if [[ -z "\$DEV" ]]; then
+    echo "[!] No base DEV found; skip default route restore" >&2
+    return 0
+  fi
   if [[ -n "\$GW" ]]; then
-    sudo ip route replace default via "\$GW" dev "\$DEV"
+    sudo ip route replace default via "\$GW" dev "\$DEV" || {
+      echo "[!] Failed to set default route via \$GW dev \$DEV" >&2
+      return 0
+    }
   else
-    sudo ip route replace default dev "\$DEV"
+    sudo ip route replace default dev "\$DEV" || {
+      echo "[!] Failed to set default route dev \$DEV" >&2
+      return 0
+    }
   fi
 }
 
 set_bypass_route() {
+  resolve_base_route
+  if [[ -z "\$DEV" ]]; then
+    echo "[!] No base DEV found; skip bypass route" >&2
+    return 0
+  fi
   if [[ -n "\$GW" ]]; then
-    sudo ip route replace "\$SERVER_IP/32" via "\$GW" dev "\$DEV"
+    sudo ip route replace "\$SERVER_IP/32" via "\$GW" dev "\$DEV" || {
+      echo "[!] Failed to add bypass route for \$SERVER_IP" >&2
+      return 0
+    }
   else
-    sudo ip route replace "\$SERVER_IP/32" dev "\$DEV"
+    sudo ip route replace "\$SERVER_IP/32" dev "\$DEV" || {
+      echo "[!] Failed to add bypass route for \$SERVER_IP" >&2
+      return 0
+    }
   fi
 }
 
-set_bypass_cidrs() {
+set_direct_routes() {
   local cidr
-  IFS=',' read -r -a items <<<"\$BYPASS_CIDRS"
+  IFS=',' read -r -a items <<<"\$DIRECT_IP_CIDRS"
   for cidr in "\${items[@]}"; do
     cidr="\${cidr#"\${cidr%%[![:space:]]*}"}"
     cidr="\${cidr%"\${cidr##*[![:space:]]}"}"
     [[ -z "\$cidr" ]] && continue
     if [[ -n "\$GW" ]]; then
-      sudo ip route replace "\$cidr" via "\$GW" dev "\$DEV"
+      if ! sudo ip route replace "\$cidr" via "\$GW" dev "\$DEV"; then
+        echo "[!] Failed to add direct route: \$cidr" >&2
+      fi
     else
-      sudo ip route replace "\$cidr" dev "\$DEV"
+      if ! sudo ip route replace "\$cidr" dev "\$DEV"; then
+        echo "[!] Failed to add direct route: \$cidr" >&2
+      fi
     fi
   done
 }
+
+del_direct_routes() {
+  local cidr
+  IFS=',' read -r -a items <<<"\$DIRECT_IP_CIDRS"
+  for cidr in "\${items[@]}"; do
+    cidr="\${cidr#"\${cidr%%[![:space:]]*}"}"
+    cidr="\${cidr%"\${cidr##*[![:space:]]}"}"
+    [[ -z "\$cidr" ]] && continue
+    sudo ip route del "\$cidr" 2>/dev/null || true
+  done
+}
+
 
 start() {
   echo "[*] Starting sing-box TUN (background)..."
@@ -786,7 +1180,7 @@ start() {
 
   set_default_route
   set_bypass_route
-  set_bypass_cidrs
+  set_direct_routes
 
   : > "\$LOG_FILE"
   setsid sudo "\$SB_BIN" run -c "\$SB_CONF" >>"\$LOG_FILE" 2>&1 < /dev/null &
@@ -818,6 +1212,7 @@ stop() {
 
   set_default_route
   sudo ip route del "\$SERVER_IP/32" 2>/dev/null || true
+  del_direct_routes
 
   if [[ -f "\$PID_FILE" ]]; then
     PID="\$(cat "\$PID_FILE" || true)"
