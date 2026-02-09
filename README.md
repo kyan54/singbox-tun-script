@@ -118,6 +118,16 @@ chmod +x uninstall-singbox-tun.sh
 
 ## 常见问题
 
+### 0) WSL 备份/还原（避免重装导致数据丢失）
+建议在变更前先备份，避免因重装或出错造成数据丢失：
+
+```bash
+wsl --shutdown
+wsl --export Ubuntu D:\wsl\ubuntu-backup.tar
+wsl --unregister Ubuntu
+wsl --import Ubuntu D:\wsl\ubuntu D:\wsl\ubuntu-backup.tar --version 2
+```
+
 ### 1) `reality verification failed`
 通常是以下参数不匹配：
 - `server_name (SNI)`
@@ -144,6 +154,22 @@ DEV="eth0"
 ```
 
 这样可以避免默认路由已经是 `tun` 时的误检测。
+
+### 4) 安装后无法上网（WSL 路由异常）
+优先查看安装时输出的这一行（脚本已自动检测好）：
+
+```bash
+cat /usr/local/lib/sing-box/sb-tun-route.sh | grep "GW=\|DEV="
+```
+
+若需要手动恢复默认路由：
+
+```bash
+sudo ip route replace default via 172.19.32.1 dev eth0
+```
+
+172.19.32.1换成GW地址
+eth0 换成DEV内容
 
 ## 安全说明
 脚本内的默认敏感参数已替换为占位符（`YOUR_*`）。
