@@ -104,6 +104,17 @@ DIRECT_DOMAINS=("example.com" "example.net")
 
 脚本会生成包含 `tun` inbound + `vless` outbound 的简化配置。
 
+如需让 Windows 上的单个程序通过 WSL 的 sing-box，可在 `singbox-tun.conf` 打开额外入站：
+
+```bash
+ENABLE_PROXY_INBOUND="1"
+PROXY_INBOUND_TYPE="mixed"   # 或 socks
+PROXY_LISTEN="0.0.0.0"
+PROXY_PORT="10806"
+```
+
+然后重跑安装脚本（覆盖配置）并重启服务，即可在 Windows 程序里把代理指向 `127.0.0.1:10806`（或 WSL IP:10806）。
+
 ## 卸载
 
 ```bash

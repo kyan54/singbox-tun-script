@@ -31,7 +31,7 @@ detect_default_dev() {
     echo "$dev"
     return
   fi
-  ip -o -4 addr show up 2>/dev/null | awk '{print $2}' | grep -v '^tun' | head -n 1
+  ip -o -4 addr show up 2>/dev/null | awk '{print $2}' | grep -Ev '^(tun|lo)$' | head -n 1
 }
 
 is_wsl() {
@@ -286,6 +286,33 @@ VERSION="${VERSION:-}"
 ARCH="${ARCH:-}"
 BIN_PATH="${BIN_PATH:-/usr/local/bin/sing-box}"
 CONF_PATH="${CONF_PATH:-/etc/sing-box-tun.json}"
+ENABLE_PROXY_INBOUND="${ENABLE_PROXY_INBOUND:-0}"
+PROXY_INBOUND_TYPE="${PROXY_INBOUND_TYPE:-mixed}"
+PROXY_LISTEN="${PROXY_LISTEN:-0.0.0.0}"
+PROXY_PORT="${PROXY_PORT:-10806}"
+
+case "${ENABLE_PROXY_INBOUND,,}" in
+  1|y|yes|true) ENABLE_PROXY_INBOUND="1" ;;
+  0|n|no|false|"") ENABLE_PROXY_INBOUND="0" ;;
+  *)
+    echo "[!] ENABLE_PROXY_INBOUND must be 0 or 1 (or yes/no)." >&2
+    exit 1
+    ;;
+esac
+
+if [[ "$ENABLE_PROXY_INBOUND" == "1" ]]; then
+  case "$PROXY_INBOUND_TYPE" in
+    mixed|socks) ;;
+    *)
+      echo "[!] PROXY_INBOUND_TYPE must be mixed or socks." >&2
+      exit 1
+      ;;
+  esac
+  if ! [[ "$PROXY_PORT" =~ ^[0-9]+$ ]] || (( 10#$PROXY_PORT < 1 || 10#$PROXY_PORT > 65535 )); then
+    echo "[!] PROXY_PORT must be a valid TCP port (1-65535)." >&2
+    exit 1
+  fi
+fi
 
 TUN_IF="${TUN_IF:-$(detect_tun_if)}"
 TUN_ADDR="${TUN_ADDR:-$(detect_tun_addr)}"
@@ -338,6 +365,21 @@ if [[ "$DIRECT_DOMAINS_JSON" != "[]" || "$DIRECT_IP_CIDRS_JSON" != "[]" ]]; then
   ROUTE_RULES+=" ],"
 fi
 
+EXTRA_INBOUND_JSON=""
+if [[ "$ENABLE_PROXY_INBOUND" == "1" ]]; then
+  EXTRA_INBOUND_JSON="$(cat <<EOF
+,
+    {
+      "type": "$PROXY_INBOUND_TYPE",
+      "tag": "proxy-in",
+      "listen": "$PROXY_LISTEN",
+      "listen_port": $PROXY_PORT,
+      "sniff": true
+    }
+EOF
+)"
+fi
+
 USE_SYSTEMD="${USE_SYSTEMD:-auto}"
 if [[ "$USE_SYSTEMD" == "auto" ]]; then
   if has_systemd; then
@@ -387,6 +429,11 @@ echo "    Helper: $HELPER_PATH"
 echo "    SNI: $SERVER_NAME"
 echo "    TUN: $TUN_IF ($TUN_ADDR)"
 echo "    Route: gw=${GW:-<none>} dev=$DEV"
+if [[ "$ENABLE_PROXY_INBOUND" == "1" ]]; then
+  echo "    Proxy inbound: $PROXY_INBOUND_TYPE://$PROXY_LISTEN:$PROXY_PORT"
+else
+  echo "    Proxy inbound: disabled"
+fi
 if [[ "$USE_SYSTEMD" == "1" ]]; then
   echo "    systemd: enabled"
 else
@@ -455,7 +502,7 @@ if [[ -f "$CONF_PATH" ]]; then
       "auto_route": false,
       "strict_route": false,
       "sniff": true
-    }
+    }$EXTRA_INBOUND_JSON
   ],
 
   "outbounds": [
@@ -502,7 +549,7 @@ else
       "auto_route": false,
       "strict_route": false,
       "sniff": true
-    }
+    }$EXTRA_INBOUND_JSON
   ],
 
   "outbounds": [
@@ -583,27 +630,27 @@ PY
 
 resolve_base_route() {
   local dev gw
-  dev="$DEV"
-  gw="$GW"
-  if [[ -z "$dev" || "$dev" =~ ^tun[0-9]+$ || ! -e "/sys/class/net/$dev" ]]; then
+  dev="\$DEV"
+  gw="\$GW"
+  if [[ -z "\$dev" || "\$dev" =~ ^tun[0-9]+$ || ! -e "/sys/class/net/\$dev" ]]; then
     dev="$(ip -o -4 route show default 2>/dev/null | awk '$0 !~ / dev tun[0-9]+/ {for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')"
-    if [[ -z "$dev" ]]; then
-      dev="$(ip -o -4 addr show up 2>/dev/null | awk '{print $2}' | grep -v '^tun' | head -n1)"
+    if [[ -z "\$dev" ]]; then
+      dev="$(ip -o -4 addr show up 2>/dev/null | awk '{print $2}' | grep -Ev '^(tun|lo)$' | head -n1)"
     fi
   fi
-  if [[ -z "$gw" ]]; then
+  if [[ -z "\$gw" ]]; then
     gw="$(ip -o -4 route show default 2>/dev/null | awk '$0 !~ / dev tun[0-9]+/ {for (i=1;i<=NF;i++) if ($i=="via") {print $(i+1); exit}}')"
   fi
-  if [[ -z "$gw" && -n "$dev" ]] && is_wsl; then
-    gw="$(guess_wsl_gw "$dev" || true)"
+  if [[ -z "\$gw" && -n "\$dev" ]] && is_wsl; then
+    gw="$(guess_wsl_gw "\$dev" || true)"
   fi
-  DEV="$dev"
-  GW="$gw"
+  DEV="\$dev"
+  GW="\$gw"
 }
 
 set_default_route() {
   resolve_base_route
-  if [[ -z "$DEV" ]]; then
+  if [[ -z "\$DEV" ]]; then
     echo "[!] No base DEV found; skip default route restore" >&2
     return 0
   fi
@@ -622,7 +669,7 @@ set_default_route() {
 
 set_bypass_route() {
   resolve_base_route
-  if [[ -z "$DEV" ]]; then
+  if [[ -z "\$DEV" ]]; then
     echo "[!] No base DEV found; skip bypass route" >&2
     return 0
   fi
@@ -830,22 +877,22 @@ PY
 
 resolve_base_route() {
   local dev gw
-  dev="$DEV"
-  gw="$GW"
-  if [[ -z "$dev" || "$dev" =~ ^tun[0-9]+$ || ! -e "/sys/class/net/$dev" ]]; then
+  dev="\$DEV"
+  gw="\$GW"
+  if [[ -z "\$dev" || "\$dev" =~ ^tun[0-9]+$ || ! -e "/sys/class/net/\$dev" ]]; then
     dev="$(ip -o -4 route show default 2>/dev/null | awk '$0 !~ / dev tun[0-9]+/ {for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')"
-    if [[ -z "$dev" ]]; then
-      dev="$(ip -o -4 addr show up 2>/dev/null | awk '{print $2}' | grep -v '^tun' | head -n1)"
+    if [[ -z "\$dev" ]]; then
+      dev="$(ip -o -4 addr show up 2>/dev/null | awk '{print $2}' | grep -Ev '^(tun|lo)$' | head -n1)"
     fi
   fi
-  if [[ -z "$gw" ]]; then
+  if [[ -z "\$gw" ]]; then
     gw="$(ip -o -4 route show default 2>/dev/null | awk '$0 !~ / dev tun[0-9]+/ {for (i=1;i<=NF;i++) if ($i=="via") {print $(i+1); exit}}')"
   fi
-  if [[ -z "$gw" && -n "$dev" ]] && is_wsl; then
-    gw="$(guess_wsl_gw "$dev" || true)"
+  if [[ -z "\$gw" && -n "\$dev" ]] && is_wsl; then
+    gw="$(guess_wsl_gw "\$dev" || true)"
   fi
-  DEV="$dev"
-  GW="$gw"
+  DEV="\$dev"
+  GW="\$gw"
 }
 
 is_running() {
@@ -1070,22 +1117,22 @@ PY
 
 resolve_base_route() {
   local dev gw
-  dev="$DEV"
-  gw="$GW"
-  if [[ -z "$dev" || "$dev" =~ ^tun[0-9]+$ || ! -e "/sys/class/net/$dev" ]]; then
+  dev="\$DEV"
+  gw="\$GW"
+  if [[ -z "\$dev" || "\$dev" =~ ^tun[0-9]+$ || ! -e "/sys/class/net/\$dev" ]]; then
     dev="$(ip -o -4 route show default 2>/dev/null | awk '$0 !~ / dev tun[0-9]+/ {for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')"
-    if [[ -z "$dev" ]]; then
-      dev="$(ip -o -4 addr show up 2>/dev/null | awk '{print $2}' | grep -v '^tun' | head -n1)"
+    if [[ -z "\$dev" ]]; then
+      dev="$(ip -o -4 addr show up 2>/dev/null | awk '{print $2}' | grep -Ev '^(tun|lo)$' | head -n1)"
     fi
   fi
-  if [[ -z "$gw" ]]; then
+  if [[ -z "\$gw" ]]; then
     gw="$(ip -o -4 route show default 2>/dev/null | awk '$0 !~ / dev tun[0-9]+/ {for (i=1;i<=NF;i++) if ($i=="via") {print $(i+1); exit}}')"
   fi
-  if [[ -z "$gw" && -n "$dev" ]] && is_wsl; then
-    gw="$(guess_wsl_gw "$dev" || true)"
+  if [[ -z "\$gw" && -n "\$dev" ]] && is_wsl; then
+    gw="$(guess_wsl_gw "\$dev" || true)"
   fi
-  DEV="$dev"
-  GW="$gw"
+  DEV="\$dev"
+  GW="\$gw"
 }
 
 is_running() {
